@@ -15,15 +15,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <iostream>
+#include <string>
+#include <iomanip>
+#include <sstream>
+#include <chrono>
+#include <vector>
 
 #ifndef SLP_WIN
 #include <signal.h>
 #endif
 
-#include <libslink.h>
-
+#include "libslink.h"
 #include "archive.h"
 #include "slinkxml.h"
+#include "hiredis.h"
+#include "jansson.h"
+#include "test.cpp"
 
 #define PACKAGE "slinktool"
 #define VERSION "4.3"
@@ -31,10 +39,13 @@
 /* Idle archive stream timeout */
 #define IDLE_ARCH_STREAM_TIMEOUT 120
 
+using namespace std;
+
 static short int verbose  = 0; /* flag to control general verbosity */
 static short int pingonly = 0; /* flag to control ping function */
 static short int ppackets = 0; /* flag to control printing of data packets */
 static short int psamples = 0; /* flag to control printing of data samples */
+static short int toredis  = 0; /* 将解析到的波形片段存入redis里 */
 static int stateint       = 0; /* packet interval to save statefile */
 static char *archformat   = 0; /* format string for a custom structure */
 static char *sdsdir       = 0; /* base directory for a SDS structure */
@@ -43,7 +54,13 @@ static char *statefile    = 0; /* state file for saving/restoring the seq. no. *
 static char *dumpfile     = 0; /* output file for data dump */
 static FILE *outfile      = 0; /* the descriptor for the dumpfile */
 
+
 static SLCD *slconn; /* connection parameters */
+
+static string redis_addr;
+static string redis_port;
+static string redis_pw;
+static redisContext *redis_ctx = NULL;
 
 /* Possible query types */
 static enum {
@@ -57,6 +74,14 @@ static enum {
   SLTKeepAliveQuery
 } slt_query = SLTNoQuery;
 
+
+// 定义存储至redis的数据结构
+// typedef struct{
+//     long long strat_time;
+//     int sample;
+//     vector<int32_t> wave;
+// } wave;
+
 /* Functions internal to this source file */
 static void packet_handler (char *msrecord, int packet_type,
                             int seqnum, int packet_size);
@@ -69,15 +94,21 @@ static int ping_server (SLCD *slconn);
 static void print_stderr (const char *message);
 static void report_environ ();
 static void usage (void);
+static void Establish_redis_connection();
+static long long Unix_to_mill(string unix_timestamp, int timezone);
+static long long btime_to_mill(struct sl_btime_s *btime);
+static void save_to_redis(char *msrecord, SLMSrecord *msr);
+vector<string> split(const std::string& str, char delimiter);
 
 #ifndef SLP_WIN
 static void term_handler (int sig);
 #endif
 
-int
-main (int argc, char **argv)
+int main (int argc, char **argv)
 {
-  SLpacket *slpack;
+
+  // long long test = Unix_to_mill("2023-07-07 13:46:02", 8);
+  SLpacket *slpack;   //seedlink packet
   int seqnum;
   int ptype;
   int packetcnt = 0;
@@ -118,6 +149,7 @@ main (int argc, char **argv)
     exit (ping_server (slconn));
 
   /* Loop with the connection manager */
+  // 主循环
   while (sl_collect (slconn, &slpack))
   {
     ptype  = sl_packettype (slpack);
@@ -165,8 +197,7 @@ main (int argc, char **argv)
  * packet_handler:
  * Process a received packet based on packet type.
  ***************************************************************************/
-static void
-packet_handler (char *msrecord, int packet_type, int seqnum, int packet_size)
+static void packet_handler (char *msrecord, int packet_type, int seqnum, int packet_size)
 {
   static SLMSrecord *msr = NULL;
 
@@ -205,6 +236,11 @@ packet_handler (char *msrecord, int packet_type, int seqnum, int packet_size)
 
     if (ppackets)
       sl_msr_print (slconn->log, msr, ppackets - 1);
+
+    //在这加redis
+    if (toredis){
+      save_to_redis(msrecord, msr);
+    }
 
     if (psamples)
       print_samples (msr);
@@ -284,8 +320,7 @@ packet_handler (char *msrecord, int packet_type, int seqnum, int packet_size)
  * -1 = XML is terminated
  *  0 = XML is not terminated
  ***************************************************************************/
-static int
-info_handler (SLMSrecord *msr, int terminate)
+static int info_handler (SLMSrecord *msr, int terminate)
 {
   static char *xml_buffer = 0;
   static int xml_size     = 0;
@@ -309,7 +344,7 @@ info_handler (SLMSrecord *msr, int terminate)
   }
 
   /* Grow XML string buffer, include room (+1) for NULL terminator */
-  if ((xml_buffer = realloc (xml_buffer, (xml_size + xml_bitsize + 1))) == NULL)
+  if ((xml_buffer = (char*)realloc(xml_buffer, (xml_size + xml_bitsize + 1))) == NULL)
   {
     sl_log (2, 0, "info_handler(): XML buffer memory allocation error\n");
     return -2;
@@ -406,8 +441,7 @@ info_handler (SLMSrecord *msr, int terminate)
  *
  * Returns 0 on success, and -1 on failure
  ***************************************************************************/
-static int
-parameter_proc (int argcount, char **argvec)
+static int parameter_proc (int argcount, char **argvec)
 {
   int error = 0;
   int optind;
@@ -467,6 +501,15 @@ parameter_proc (int argcount, char **argvec)
     else if (strcmp (argvec[optind], "-nd") == 0)
     {
       slconn->netdly = atoi (getoptval (argcount, argvec, optind++));
+    }
+    else if (strcmp (argvec[optind], "-R") == 0)
+    {
+      toredis = 1;
+      vector<string> ip_port = split(argvec[++optind], ':');
+      redis_addr = ip_port[0];
+      redis_port = ip_port[1];
+      redis_pw = argvec[++optind];
+      Establish_redis_connection();
     }
     else if (strcmp (argvec[optind], "-k") == 0)
     {
@@ -729,8 +772,7 @@ getoptval (int argcount, char **argvec, int argopt)
  * print_samples:
  * Print samples in the supplied SLMSrecord with a simple format.
  ***************************************************************************/
-static void
-print_samples (SLMSrecord *msr)
+static void print_samples (SLMSrecord *msr)
 {
   int line, lines, col, cnt;
 
@@ -906,6 +948,133 @@ term_handler (int sig)
 }
 #endif
 
+
+// std string的split 函数
+std::vector<std::string> split(const std::string& str, char delimiter) {
+    std::vector<std::string> result;
+    std::stringstream ss(str);
+    std::string token;
+    while (std::getline(ss, token, delimiter)) {
+        result.push_back(token);
+    }
+    return result;
+}
+
+// 建立redis连接
+static void Establish_redis_connection() {
+  redis_ctx = redisConnect(redis_addr.data(), stoi(redis_port));
+  if (redis_ctx == NULL || redis_ctx->err) {
+    if (redis_ctx) {
+      printf("\033[1;31mRedis connection ERROR: %s\033[0m\n", redis_ctx->errstr);
+    }       
+    else {
+      cout << 
+      "\033[1;31mRedis connection ERROR: can't allocate redis context\033[0m" << endl;
+    }
+    exit(1);
+  }
+
+  if (redis_pw == "null") {
+    cout << "\033[1;32mRedis connection establish SUCCESS\033[0m" << endl;
+    return;
+  }
+
+  redisReply *reply = (redisReply *)redisCommand(redis_ctx, "AUTH %s", redis_pw.data());
+  if ((string)reply->str == "OK") {
+    cout << "\033[1;32mRedis connection establish SUCCESS\033[0m" << endl;
+    freeReplyObject(reply);
+  }
+  else {
+    printf("\033[1;31mRedis Authentication ERROR: %s\033[0m\n", reply->str);
+    freeReplyObject(reply);
+    exit(1);
+  }
+}
+
+
+// 标准unix时间戳转毫秒
+static long long Unix_to_mill(string unix_timestamp, int timezone=8) {
+
+  // 将时间字符串转换成时间点
+  std::tm tm = {};
+  std::istringstream ss(unix_timestamp);
+  ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+  const auto tp = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+
+  // 将时间点转换成毫秒数
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count();
+  long long ms2 = static_cast<long long>(ms);
+  // 计算时区小时差
+  ms2 -= timezone*3600*1000;
+
+  return ms2;
+}
+
+
+// btime结构体时间转毫秒
+static long long btime_to_mill(struct sl_btime_s *btime) {
+  // 先将年份取出，构造元旦零点的unix时间戳并计算毫秒
+  long long years_mill = Unix_to_mill(to_string(btime->year) + "-01-01 00:00:00");
+  // 再计算日 时分秒 的 毫秒数
+  long long days_mill = 
+    1000*3600*24*(long long)(btime->day - 1) + 
+    1000*3600*(long long)(btime->hour) + 
+    1000*60*(long long)(btime->min) + 
+    1000*(long long)(btime->sec) + 
+    (long long)(btime->fract) / 10;
+  // 二者相加，即可获得正确毫秒数
+  return years_mill + days_mill;
+}
+
+// 将接收到的数据包存入redis
+static void save_to_redis(char *msrecord, SLMSrecord *msr) {
+  // 获取台站-分量信息 & 波形数据
+  char sourcename[50];
+  int cnt;
+  int sr;
+  vector<int32_t> wave;
+  long long timestamp;
+
+  sl_msr_parse (slconn->log, msrecord, &msr, 1, 1); // 获取波形数据
+  sl_msr_srcname (msr, sourcename, 0);  // 获取台站和分量名
+  sr = msr->fsdh.samprate_fact; // 采样率
+  timestamp = btime_to_mill(&(msr->fsdh.start_time));
+  
+  if (msr->datasamples != NULL)
+  {
+    for (cnt = 0; cnt < msr->numsamples; cnt++) {
+      wave.push_back(*(msr->datasamples + cnt));
+    }
+  }
+
+
+  // 存储至redis
+  json_t* root = json_object();
+  json_object_set_new(root, "start_time", json_integer(timestamp));
+  json_object_set_new(root, "sample_rate", json_integer(sr));
+
+  json_t* v = json_array();
+  for (int i = 0; i < wave.size(); i++) {
+      json_array_append_new(v, json_integer(wave[i]));
+  }
+
+  json_object_set_new(root, "wave", v);
+
+  char* json = json_dumps(root, JSON_COMPACT);
+  json_decref(root);
+
+  redisReply* reply1 = (redisReply*)redisCommand(redis_ctx, "RPUSH %s %s", sourcename, json);
+  redisReply* reply2 = (redisReply*)redisCommand(redis_ctx, "LLEN %s", sourcename);
+  if(reply2->integer==50){
+      redisReply* reply3 = (redisReply*)redisCommand(redis_ctx, "LPOP %s", sourcename);
+      freeReplyObject(reply3);
+  }
+  freeReplyObject(reply1);
+  freeReplyObject(reply2);
+  free(json);
+
+}
+
 /***************************************************************************
  * usage:
  * Print the usage message and exit.
@@ -922,6 +1091,7 @@ usage (void)
            " -v              be more verbose, multiple flags can be used\n"
            " -P              ping the server, report the server ID and exit\n"
            " -p              print details of data packets, multiple flags can be used\n"
+           " -r [ip_addr:port] [password] save stream into redis\n"
            " -u              print unpacked samples of data packets\n\n"
            " -nd delay       network re-connect delay (seconds), default 30\n"
            " -nt timeout     network timeout (seconds), re-establish connection if no\n"
@@ -962,4 +1132,5 @@ usage (void)
            " [host][:][port] Address of the SeedLink server in host:port format\n"
            "                   Default host is 'localhost' and default port is '18000'\n");
 
-} /* End of usage() */
+} 
+/* End of usage() */

@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        
+    {
+        "name": "For Debug",
+        "type": "cppdbg",
+        "request": "launch",
+        "preLaunchTask": "C/C++: g++ build active file",
+        "program": "/mnt/slinktool_redis/src/slinktool",
+        // 参数搁这写
+        //"args": ["-vv", "-u", "-pp", "-r", "127.0.0.1:8848", "-s", "BHE.D", "-o", "data.mseed", "127.0.0.1:18001"],172.21.128.1  192.168.153.129:6379
+        "args": ["-vv", "-pp", "-R", "172.21.128.1:6379", "12345678", "-o", "data.mseed", "127.0.0.1:18001"],
+        //"args": ["-vv", "-u", "-pp", "-s", "BHE.D", "-o", "data.mseed", "127.0.0.1:18001"],
+        "cwd": "${workspaceFolder}"
+    }
+    ]
+}

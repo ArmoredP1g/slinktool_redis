@@ -34,8 +34,7 @@ int update_stream (SLCD *slconn, SLpacket *slpack);
  * the server or the termination sequence completed SLTERMINATE is
  * returned and the slpack pointer is set to NULL.
  ***************************************************************************/
-int
-sl_collect (SLCD *slconn, SLpacket **slpack)
+int sl_collect (SLCD *slconn, SLpacket **slpack)
 {
   int bytesread;
   double current_time;

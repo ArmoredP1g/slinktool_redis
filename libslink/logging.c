@@ -31,8 +31,7 @@ SLlog gSLlog = {NULL, NULL, NULL, NULL, 0};
  *
  * See sl_loginit_main() description for usage.
  ***************************************************************************/
-void
-sl_loginit (int verbosity,
+void sl_loginit (int verbosity,
             void (*log_print) (const char *), const char *logprefix,
             void (*diag_print) (const char *), const char *errprefix)
 {
@@ -180,8 +179,7 @@ sl_loginit_main (SLlog *logp, int verbosity,
  *
  * See sl_log_main() description for return values.
  ***************************************************************************/
-int
-sl_log (int level, int verb, ...)
+int sl_log (int level, int verb, ...)
 {
   int retval;
   va_list varlist;

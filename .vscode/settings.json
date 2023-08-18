@@ -1,0 +1,9 @@
+{
+    "files.associations": {
+        "*.py": "python",
+        "iosfwd": "cpp",
+        "chrono": "cpp",
+        "iostream": "cpp",
+        "ostream": "cpp"
+    }
+}

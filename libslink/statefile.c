@@ -24,8 +24,7 @@
  * -1 : error
  *  0 : completed successfully
  ***************************************************************************/
-int
-sl_savestate (SLCD *slconn, const char *statefile)
+int sl_savestate (SLCD *slconn, const char *statefile)
 {
   SLstream *curstream;
   char line[100];
